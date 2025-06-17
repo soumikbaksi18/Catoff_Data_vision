@@ -2,98 +2,70 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 import easyocr
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance
 import io
 import re
 
 app = FastAPI()
 reader = easyocr.Reader(['en'])
 
-FIELDS = [
-    ("possession_pct", r"Possession\s*%?\s*[:\-]?\s*(\d+)"),
-    ("shots", r"Shots\s*[:\-]?\s*(\d+)"),
-    ("expected_goals", r"Expected\s*Goals?\s*[:\-]?\s*([\d\.,]+)"),
-    ("passes", r"Passes\s*[:\-]?\s*(\d+)"),
-    ("tackles", r"Tackles\s*[:\-]?\s*(\d+)"),
-    ("tackles_won", r"Tackles\s*Won\s*[:\-]?\s*(\d+)"),
-    ("interceptions", r"Interceptions\s*[:\-]?\s*(\d+)"),
-    ("saves", r"Saves\s*[:\-]?\s*(\d+)"),
-    ("fouls_committed", r"Fouls?\s*Committed\s*[:\-]?\s*(\d+)"),
-    ("offsides", r"Offsides?\s*[:\-]?\s*(\d+)"),
-    ("corners", r"Corners?\s*[:\-]?\s*(\d+)"),
-    ("free_kicks", r"Free\s*Kicks?\s*[:\-]?\s*(\d+)"),
-    ("penalty_kicks", r"Penalty\s*Kicks?\s*[:\-]?\s*(\d+)"),
-    ("yellow_cards", r"Yellow\s*Cards?\s*[:\-]?\s*(\d+)"),
-    ("red_cards", r"Red\s*Cards?\s*[:\-]?\s*(\d+)"),
-    ("dribble_success_rate", r"Dribble\s*Success\s*Rate\s*[:\-]?\s*(\d+)%"),
-    ("shot_accuracy", r"Shot\s*Accuracy\s*[:\-]?\s*(\d+)%"),
-    ("pass_accuracy", r"Pass\s*Accuracy\s*[:\-]?\s*(\d+)%"),
-]
-
 @app.post("/upload-scorecard/")
 async def upload_scorecard(file: UploadFile = File(...)):
     try:
         contents = await file.read()
+        # Enhance contrast for better OCR
         image = Image.open(io.BytesIO(contents)).convert("RGB")
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(2.5)
         image_np = np.array(image)
 
-        results = reader.readtext(image_np, detail=0)
-        ocr_text = "\n".join(results)
-        print("\n--- OCR Results ---\n", ocr_text, "\n--- END OCR ---\n")
+        # Get OCR results with bounding box and text
+        results = reader.readtext(image_np)
+        # Filter for largest text (scoreboard is usually the largest text)
+        results_sorted = sorted(results, key=lambda r: (r[0][1][1] - r[0][0][1]) * (r[0][2][0] - r[0][0][0]), reverse=True)
+        candidate_lines = [r[1] for r in results_sorted[:3]]  # Top 3 largest text boxes
 
-        teams, score = extract_teams_and_score(ocr_text)
-        player_stats, opponent_stats = extract_stats(ocr_text)
+        print("OCR Candidate Lines:", candidate_lines)
 
-        player_stats["team"] = teams[0]
-        player_stats["score"] = score[0]
-        opponent_stats["team"] = teams[1]
-        opponent_stats["score"] = score[1]
+        player_team, player_goals, opponent_team, opponent_goals = extract_teams_and_scores_from_lines(candidate_lines)
 
-        scorecard_data = {
-            "Player_Data": player_stats,
-            "Opponent_Data": opponent_stats
+        response = {
+            "Player_Team": player_team,
+            "Player_Goals": player_goals,
+            "Opponent_Team": opponent_team,
+            "Opponent_Goals": opponent_goals
         }
 
-        return JSONResponse(content={
-            "scorecard_data": scorecard_data,
-            "ocr_text": ocr_text   # For debug, you can remove this in prod
-        })
+        return JSONResponse(content=response)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-def extract_teams_and_score(text):
-    # Try to find: "ARGENTINA 4 - 0 BRAZIL"
-    team_score_pattern = re.compile(r"([A-Z]+)\s+(\d+)[^\d]+(\d+)\s+([A-Z]+)")
-    match = team_score_pattern.search(text.replace("\n", " "))
+
+def extract_teams_and_scores_from_lines(lines):
+    # Try to join all candidate lines in case OCR split "ARGENTINA 4 : 0 BRAZIL" into multiple boxes
+    full_line = " ".join(lines)
+    # Remove non-ASCII except colon/dash/space
+    clean = re.sub(r"[^A-Za-z0-9:\-\s]", "", full_line)
+    print("Cleaned header line:", clean)
+    # Robust matching for common separators and OCR quirks (I for :, | for : etc)
+    match = re.search(
+        r"([A-Z]+)\s+(\d+)\s*[:\-\|Iil]\s*(\d+)\s+([A-Z]+)", clean
+    )
     if match:
-        team1, score1, score2, team2 = match.groups()
-        return [team1.lower(), team2.lower()], [int(score1), int(score2)]
-    # Fallback
-    return ["team1", "team2"], [0, 0]
-
-def extract_stats(text):
-    # Split lines, try to separate player/opponent by order
-    lines = [line for line in text.split("\n") if line.strip()]
-    mid = len(lines) // 2
-    left_block = "\n".join(lines[:mid])
-    right_block = "\n".join(lines[mid:])
-
-    player_stats = extract_stats_from_block(left_block)
-    opponent_stats = extract_stats_from_block(right_block)
-    return player_stats, opponent_stats
-
-def extract_stats_from_block(block):
-    stats = {}
-    for key, pattern in FIELDS:
-        match = re.search(pattern, block, re.IGNORECASE)
-        if match:
-            value = match.group(1).replace(",", ".")
-            if "." in value:
-                stats[key] = float(value)
-            else:
-                stats[key] = int(value)
-        else:
-            stats[key] = 0
-    return stats
+        player_team = match.group(1).title()
+        player_goals = int(match.group(2))
+        opponent_goals = int(match.group(3))
+        opponent_team = match.group(4).title()
+        return player_team, player_goals, opponent_team, opponent_goals
+    # Fallback: Try (team num num team)
+    match = re.search(r"([A-Z]+)\s+(\d+)\s+(\d+)\s+([A-Z]+)", clean)
+    if match:
+        player_team = match.group(1).title()
+        player_goals = int(match.group(2))
+        opponent_goals = int(match.group(3))
+        opponent_team = match.group(4).title()
+        return player_team, player_goals, opponent_team, opponent_goals
+    # Final fallback
+    return "Team1", 0, "Team2", 0
 
 # To run: uvicorn main:app --reload
