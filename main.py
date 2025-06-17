@@ -1,91 +1,99 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 import easyocr
+import numpy as np
 from PIL import Image
 import io
+import re
 
-# Initialize FastAPI app
 app = FastAPI()
+reader = easyocr.Reader(['en'])
 
-# Initialize OCR Reader
-reader = easyocr.Reader(['en'])  # Using EasyOCR
+FIELDS = [
+    ("possession_pct", r"Possession\s*%?\s*[:\-]?\s*(\d+)"),
+    ("shots", r"Shots\s*[:\-]?\s*(\d+)"),
+    ("expected_goals", r"Expected\s*Goals?\s*[:\-]?\s*([\d\.,]+)"),
+    ("passes", r"Passes\s*[:\-]?\s*(\d+)"),
+    ("tackles", r"Tackles\s*[:\-]?\s*(\d+)"),
+    ("tackles_won", r"Tackles\s*Won\s*[:\-]?\s*(\d+)"),
+    ("interceptions", r"Interceptions\s*[:\-]?\s*(\d+)"),
+    ("saves", r"Saves\s*[:\-]?\s*(\d+)"),
+    ("fouls_committed", r"Fouls?\s*Committed\s*[:\-]?\s*(\d+)"),
+    ("offsides", r"Offsides?\s*[:\-]?\s*(\d+)"),
+    ("corners", r"Corners?\s*[:\-]?\s*(\d+)"),
+    ("free_kicks", r"Free\s*Kicks?\s*[:\-]?\s*(\d+)"),
+    ("penalty_kicks", r"Penalty\s*Kicks?\s*[:\-]?\s*(\d+)"),
+    ("yellow_cards", r"Yellow\s*Cards?\s*[:\-]?\s*(\d+)"),
+    ("red_cards", r"Red\s*Cards?\s*[:\-]?\s*(\d+)"),
+    ("dribble_success_rate", r"Dribble\s*Success\s*Rate\s*[:\-]?\s*(\d+)%"),
+    ("shot_accuracy", r"Shot\s*Accuracy\s*[:\-]?\s*(\d+)%"),
+    ("pass_accuracy", r"Pass\s*Accuracy\s*[:\-]?\s*(\d+)%"),
+]
 
-# Function to process image and extract statistics
-def extract_match_stats(image: Image.Image):
-    # Convert image to text using EasyOCR or pytesseract
-    text = reader.readtext(image)
-
-    # Example: Extracting specific statistics by pattern matching
-    stats = {
-        'player_goals': 0,
-        'player_passes': 0,
-        'player_fouls': 0,
-        'player_offsides': 0,
-        'player_yellow_cards': 0,
-        'player_red_cards': 0,
-        'opponent_goals': 0,
-        'opponent_passes': 0,
-        'opponent_fouls': 0,
-        'opponent_offsides': 0,
-        'opponent_yellow_cards': 0,
-        'opponent_red_cards': 0
-    }
-    
-    # Example logic to process the extracted text
-    for detection in text:
-        # Match and process keywords to populate stats (simplified example)
-        detected_text = detection[1].lower()
-        if "goal" in detected_text:
-            if "player" in detected_text:
-                stats['player_goals'] += 1
-            else:
-                stats['opponent_goals'] += 1
-        elif "pass" in detected_text:
-            if "player" in detected_text:
-                stats['player_passes'] += 1
-            else:
-                stats['opponent_passes'] += 1
-        elif "foul" in detected_text:
-            if "player" in detected_text:
-                stats['player_fouls'] += 1
-            else:
-                stats['opponent_fouls'] += 1
-        elif "offside" in detected_text:
-            if "player" in detected_text:
-                stats['player_offsides'] += 1
-            else:
-                stats['opponent_offsides'] += 1
-        elif "yellow card" in detected_text:
-            if "player" in detected_text:
-                stats['player_yellow_cards'] += 1
-            else:
-                stats['opponent_yellow_cards'] += 1
-        elif "red card" in detected_text:
-            if "player" in detected_text:
-                stats['player_red_cards'] += 1
-            else:
-                stats['opponent_red_cards'] += 1
-
-    return stats
-
-# Endpoint to upload image and process it
-@app.post("/upload_match_stats/")
-async def upload_image(file: UploadFile = File(...)):
+@app.post("/upload-scorecard/")
+async def upload_scorecard(file: UploadFile = File(...)):
     try:
-        # Read the uploaded image
-        image_data = await file.read()
-        image = Image.open(io.BytesIO(image_data))
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+        image_np = np.array(image)
 
-        # Extract stats from the image
-        stats = extract_match_stats(image)
+        results = reader.readtext(image_np, detail=0)
+        ocr_text = "\n".join(results)
+        print("\n--- OCR Results ---\n", ocr_text, "\n--- END OCR ---\n")
 
-        # Return the extracted stats
-        return JSONResponse(content={"stats": stats})
-    
+        teams, score = extract_teams_and_score(ocr_text)
+        player_stats, opponent_stats = extract_stats(ocr_text)
+
+        player_stats["team"] = teams[0]
+        player_stats["score"] = score[0]
+        opponent_stats["team"] = teams[1]
+        opponent_stats["score"] = score[1]
+
+        scorecard_data = {
+            "Player_Data": player_stats,
+            "Opponent_Data": opponent_stats
+        }
+
+        return JSONResponse(content={
+            "scorecard_data": scorecard_data,
+            "ocr_text": ocr_text   # For debug, you can remove this in prod
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Run the FastAPI app
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+def extract_teams_and_score(text):
+    # Try to find: "ARGENTINA 4 - 0 BRAZIL"
+    team_score_pattern = re.compile(r"([A-Z]+)\s+(\d+)[^\d]+(\d+)\s+([A-Z]+)")
+    match = team_score_pattern.search(text.replace("\n", " "))
+    if match:
+        team1, score1, score2, team2 = match.groups()
+        return [team1.lower(), team2.lower()], [int(score1), int(score2)]
+    # Fallback
+    return ["team1", "team2"], [0, 0]
+
+def extract_stats(text):
+    # Split lines, try to separate player/opponent by order
+    lines = [line for line in text.split("\n") if line.strip()]
+    mid = len(lines) // 2
+    left_block = "\n".join(lines[:mid])
+    right_block = "\n".join(lines[mid:])
+
+    player_stats = extract_stats_from_block(left_block)
+    opponent_stats = extract_stats_from_block(right_block)
+    return player_stats, opponent_stats
+
+def extract_stats_from_block(block):
+    stats = {}
+    for key, pattern in FIELDS:
+        match = re.search(pattern, block, re.IGNORECASE)
+        if match:
+            value = match.group(1).replace(",", ".")
+            if "." in value:
+                stats[key] = float(value)
+            else:
+                stats[key] = int(value)
+        else:
+            stats[key] = 0
+    return stats
+
+# To run: uvicorn main:app --reload
