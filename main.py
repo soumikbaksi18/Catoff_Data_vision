@@ -13,17 +13,18 @@ reader = easyocr.Reader(['en'])
 async def upload_scorecard(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-        # Enhance contrast for better OCR
         image = Image.open(io.BytesIO(contents)).convert("RGB")
-        enhancer = ImageEnhance.Contrast(image)
-        image = enhancer.enhance(2.5)
         image_np = np.array(image)
 
-        # Get OCR results with bounding box and text
-        results = reader.readtext(image_np)
-        # Filter for largest text (scoreboard is usually the largest text)
-        results_sorted = sorted(results, key=lambda r: (r[0][1][1] - r[0][0][1]) * (r[0][2][0] - r[0][0][0]), reverse=True)
-        candidate_lines = [r[1] for r in results_sorted[:3]]  # Top 3 largest text boxes
+        # Restrict OCR to only top 15% of the image (heading area)
+        h = image_np.shape[0]
+        heading_area = image_np[:int(h*0.18), :, :]  # you can tweak the 0.18 if needed
+
+        results = reader.readtext(heading_area)
+        # Sort and extract top lines as before
+        results_sorted = sorted(
+            results, key=lambda r: (r[0][1][1] - r[0][0][1]) * (r[0][2][0] - r[0][0][0]), reverse=True)
+        candidate_lines = [r[1] for r in results_sorted[:3]]
 
         print("OCR Candidate Lines:", candidate_lines)
 
