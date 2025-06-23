@@ -16,10 +16,9 @@ async def upload_scorecard(file: UploadFile = File(...)):
         image = Image.open(io.BytesIO(contents)).convert("RGB")
         image_np = np.array(image)
 
-        # --- Heading/Goals extraction (unchanged) ---
-        h = image_np.shape[0]
-        heading_area = image_np[:int(h*0.18), :, :]  # You can tweak the 0.18 if needed
 
+        h = image_np.shape[0]
+        heading_area = image_np[:int(h*0.18), :, :]  
         results = reader.readtext(heading_area)
         results_sorted = sorted(
             results, key=lambda r: (r[0][1][1] - r[0][0][1]) * (r[0][2][0] - r[0][0][0]), reverse=True)
@@ -29,7 +28,6 @@ async def upload_scorecard(file: UploadFile = File(...)):
 
         player_team, player_goals, opponent_team, opponent_goals = extract_teams_and_scores_from_lines(candidate_lines)
 
-        # --- NEW: Only Shots, Passes, Tackles, Saves ---
         player_stats, opponent_stats = extract_selected_stats_from_image(image)
 
         response = {
@@ -76,30 +74,42 @@ def extract_selected_stats_from_image(image):
     results = reader.readtext(stats_area, detail=0)
     joined = "\n".join(results)
     lines = [
-        l.strip().upper().replace("0", "O").replace("5", "S")
-        for l in joined.split('\n') if l.strip()
+        l.strip().upper().replace("O", "0") for l in joined.split('\n') if l.strip()
     ]
     print("STATS OCR LINES:", lines)
 
     label_map = {
         "SHOTS": "Shots",
         "PASSES": "Passes",
-        "TACKLES": "Tackles",
+        "TACKLES": "Tackles Won",
         "SAVES": "Saves"
     }
     player_stats = {}
     opponent_stats = {}
 
+
+    def find_valid_number(lines, idx, direction):
+        steps = [1, 2] if direction == 'after' else [-1, -2]
+        for step in steps:
+            pos = idx + step
+            if 0 <= pos < len(lines):
+                num = re.sub(r"\D", "", lines[pos])
+                if num and num.isdigit():
+                    val = int(num)
+                    if label_map.get(lines[idx], '') == "Passes":
+                        if 0 <= val <= 200:
+                            return val
+                    else:
+                        if 0 <= val <= 30:
+                            return val
+        return 0
+
     for idx, line in enumerate(lines):
         for label, field_name in label_map.items():
             if line == label:
-                try:
-                    player_val = lines[idx - 1]
-                    opponent_val = lines[idx + 1]
-                    player_stats[field_name] = int(re.sub(r"\D", "", player_val)) if re.search(r"\d", player_val) else 0
-                    opponent_stats[field_name] = int(re.sub(r"\D", "", opponent_val)) if re.search(r"\d", opponent_val) else 0
-                except Exception:
-                    player_stats[field_name] = 0
-                    opponent_stats[field_name] = 0
+                player_val = find_valid_number(lines, idx, 'before')
+                opponent_val = find_valid_number(lines, idx, 'after')
+                player_stats[field_name] = player_val
+                opponent_stats[field_name] = opponent_val
 
     return player_stats, opponent_stats
